@@ -255,7 +255,7 @@ private:
 
     int getSchema();
 
-    void openDB(bool create);
+    void openDB(bool create, bool readOnly = false);
 
     void makeStoreWritable();
 

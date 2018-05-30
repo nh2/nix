@@ -102,6 +102,8 @@ void SQLiteStmt::create(sqlite3 * db, const string & s)
 
 void SQLiteStmt::reset()
 {
+    // if (settings.readOnlyMode) return;
+
     assert(stmt);
     /* Note: sqlite3_reset() returns the error code for the most
        recent call to sqlite3_step().  So ignore it. */
@@ -227,7 +229,7 @@ LocalStore::LocalStore(bool reserveSpace)
 
     if (settings.readOnlyMode) {
         curSchema = getSchema();
-        openDB(false);
+        openDB(false, true);
         return;
     }
 
@@ -312,7 +314,7 @@ LocalStore::LocalStore(bool reserveSpace)
         if (e.errNo != EACCES) throw;
         settings.readOnlyMode = true;
         curSchema = getSchema();
-        openDB(false);
+        openDB(false, true);
         return;
     }
 
@@ -400,16 +402,20 @@ int LocalStore::getSchema()
 }
 
 
-void LocalStore::openDB(bool create)
+void LocalStore::openDB(bool create, bool readOnly)
 {
-    if (access(settings.nixDBPath.c_str(), R_OK | W_OK))
-        throw SysError(format("Nix database directory ‘%1%’ is not writable") % settings.nixDBPath);
+    if (access(settings.nixDBPath.c_str(), R_OK | (readOnly ? 0 : W_OK)))
+        throw SysError(format("!Nix database directory ‘%1%’ is not writable") % settings.nixDBPath);
 
     /* Open the Nix database. */
     string dbPath = settings.nixDBPath + "/db.sqlite";
+    std::cerr << "before open" << std::endl;
     if (sqlite3_open_v2(dbPath.c_str(), &db.db,
-            SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0), 0) != SQLITE_OK)
+            (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE) |
+            ((create && !readOnly) ? SQLITE_OPEN_CREATE : 0),
+            0) != SQLITE_OK)
         throw Error(format("cannot open Nix database ‘%1%’") % dbPath);
+    std::cerr << "after open" << std::endl;
 
     if (sqlite3_busy_timeout(db, 60 * 60 * 1000) != SQLITE_OK)
         throwSQLiteError(db, "setting timeout");
@@ -420,47 +426,53 @@ void LocalStore::openDB(bool create)
     /* !!! check whether sqlite has been built with foreign key
        support */
 
-    /* Whether SQLite should fsync().  "Normal" synchronous mode
-       should be safe enough.  If the user asks for it, don't sync at
-       all.  This can cause database corruption if the system
-       crashes. */
-    string syncMode = settings.fsyncMetadata ? "normal" : "off";
-    if (sqlite3_exec(db, ("pragma synchronous = " + syncMode + ";").c_str(), 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, "setting synchronous mode");
 
-    /* Set the SQLite journal mode.  WAL mode is fastest, so it's the
-       default. */
-    string mode = settings.useSQLiteWAL ? "wal" : "truncate";
-    string prevMode;
-    {
-        SQLiteStmt stmt;
-        stmt.create(db, "pragma main.journal_mode;");
-        if (sqlite3_step(stmt) != SQLITE_ROW)
-            throwSQLiteError(db, "querying journal mode");
-        prevMode = string((const char *) sqlite3_column_text(stmt, 0));
+    if (!readOnly) {
+        /* Whether SQLite should fsync().  "Normal" synchronous mode
+           should be safe enough.  If the user asks for it, don't sync at
+           all.  This can cause database corruption if the system
+           crashes. */
+        string syncMode = settings.fsyncMetadata ? "normal" : "off";
+        if (sqlite3_exec(db, ("pragma synchronous = " + syncMode + ";").c_str(), 0, 0, 0) != SQLITE_OK)
+            throwSQLiteError(db, "setting synchronous mode");
+
+        /* Set the SQLite journal mode.  WAL mode is fastest, so it's the
+           default. */
+        string mode = settings.useSQLiteWAL ? "wal" : "truncate";
+        string prevMode;
+        {
+            SQLiteStmt stmt;
+            stmt.create(db, "pragma main.journal_mode;");
+            if (sqlite3_step(stmt) != SQLITE_ROW)
+                throwSQLiteError(db, "querying journal mode");
+            prevMode = string((const char *) sqlite3_column_text(stmt, 0));
+        }
+        if (prevMode != mode &&
+            sqlite3_exec(db, ("pragma main.journal_mode = " + mode + ";").c_str(), 0, 0, 0) != SQLITE_OK)
+            throwSQLiteError(db, "setting journal mode");
+
+        /* Increase the auto-checkpoint interval to 40000 pages.  This
+           seems enough to ensure that instantiating the NixOS system
+           derivation is done in a single fsync(). */
+        if (mode == "wal" && sqlite3_exec(db, "pragma wal_autocheckpoint = 40000;", 0, 0, 0) != SQLITE_OK)
+            throwSQLiteError(db, "setting autocheckpoint interval");
+
+        /* Initialise the database schema, if necessary. */
+        if (create) {
+            const char * schema =
+    #include "schema.sql.hh"
+                ;
+            if (sqlite3_exec(db, (const char *) schema, 0, 0, 0) != SQLITE_OK)
+                throwSQLiteError(db, "initialising database schema");
+        }
     }
-    if (prevMode != mode &&
-        sqlite3_exec(db, ("pragma main.journal_mode = " + mode + ";").c_str(), 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, "setting journal mode");
 
-    /* Increase the auto-checkpoint interval to 40000 pages.  This
-       seems enough to ensure that instantiating the NixOS system
-       derivation is done in a single fsync(). */
-    if (mode == "wal" && sqlite3_exec(db, "pragma wal_autocheckpoint = 40000;", 0, 0, 0) != SQLITE_OK)
-        throwSQLiteError(db, "setting autocheckpoint interval");
-
-    /* Initialise the database schema, if necessary. */
-    if (create) {
-        const char * schema =
-#include "schema.sql.hh"
-            ;
-        if (sqlite3_exec(db, (const char *) schema, 0, 0, 0) != SQLITE_OK)
-            throwSQLiteError(db, "initialising database schema");
-    }
+    std::cerr << "1" << std::endl;
 
     /* Prepare SQL statements. */
     stmtRegisterValidPath.create(db,
         "insert into ValidPaths (path, hash, registrationTime, deriver, narSize) values (?, ?, ?, ?, ?);");
+    std::cerr << "1.1" << std::endl;
     stmtUpdatePathInfo.create(db,
         "update ValidPaths set narSize = ?, hash = ? where path = ?;");
     stmtAddReference.create(db,
@@ -495,6 +507,9 @@ void LocalStore::openDB(bool create)
     // ensure efficient lookup.
     stmtQueryPathFromHashPart.create(db,
         "select path from ValidPaths where path >= ? limit 1;");
+
+    std::cerr << "2" << std::endl;
+
 }
 
 
