@@ -26,6 +26,7 @@ struct LegacySSHStore : public Store
         FdSink to;
         FdSource from;
         int remoteVersion;
+        bool good = true;
     };
 
     std::string host;
@@ -40,7 +41,7 @@ struct LegacySSHStore : public Store
         , connections(make_ref<Pool<Connection>>(
             std::max(1, (int) maxConnections),
             [this]() { return openConnection(); },
-            [](const ref<Connection> & r) { return true; }
+            [](const ref<Connection> & r) { return r->good; }
             ))
         , master(
             host,
@@ -55,7 +56,7 @@ struct LegacySSHStore : public Store
     ref<Connection> openConnection()
     {
         auto conn = make_ref<Connection>();
-        conn->sshConn = master.startCommand("nix-store --serve --write");
+        conn->sshConn = master.startCommand("command time nix-store --serve --write");
         conn->to = FdSink(conn->sshConn->in.get());
         conn->from = FdSource(conn->sshConn->out.get());
 
@@ -127,18 +128,48 @@ struct LegacySSHStore : public Store
 
         auto conn(connections->get());
 
-        conn->to
-            << cmdImportPaths
-            << 1;
-        copyNAR(source, conn->to);
-        conn->to
-            << exportMagic
-            << info.path
-            << info.references
-            << info.deriver
-            << 0
-            << 0;
-        conn->to.flush();
+        if (GET_PROTOCOL_MINOR(conn->remoteVersion) >= 4) {
+
+            conn->to
+                << cmdAddToStoreNar
+                << info.path
+                << info.deriver
+                << info.narHash.to_string(Base16, false)
+                << info.references
+                << info.registrationTime
+                << info.narSize
+                << info.ultimate
+                << info.sigs
+                << info.ca;
+            try {
+                copyNAR(source, conn->to);
+            } catch (...) {
+                conn->good = false;
+                throw;
+            }
+            conn->to.flush();
+
+        } else {
+
+            conn->to
+                << cmdImportPaths
+                << 1;
+            try {
+                copyNAR(source, conn->to);
+            } catch (...) {
+                conn->good = false;
+                throw;
+            }
+            conn->to
+                << exportMagic
+                << info.path
+                << info.references
+                << info.deriver
+                << 0
+                << 0;
+            conn->to.flush();
+
+        }
 
         if (readInt(conn->from) != 1)
             throw Error("failed to add path '%s' to remote host '%s', info.path, host");
