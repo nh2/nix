@@ -880,8 +880,8 @@ pid_t startProcess(std::function<void()> fun, const ProcessOptions & options)
             logger = makeDefaultLogger();
         try {
 #if __linux__
-            if (options.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
-                throw SysError("setting death signal");
+            //if (options.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+            //    throw SysError("setting death signal");
 #endif
             restoreAffinity();
             fun();
